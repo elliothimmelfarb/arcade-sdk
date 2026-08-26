@@ -1,0 +1,23 @@
+{
+  "name": "arcade-sdk",
+  "version": "1.0.0",
+  "description": "Identity, save states, leaderboards, achievements and async multiplayer for a browser game, from one script tag.",
+  "license": "MIT",
+  "author": "Elliot Himmelfarb",
+  "type": "module",
+  "main": "arcade.js",
+  "types": "types/arcade.d.ts",
+  "files": [
+    "arcade.js",
+    "types/arcade.d.ts",
+    "docs",
+    "examples"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "keywords": ["arcade", "game", "leaderboard", "achievements", "sdk", "aimade.games"],
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}
