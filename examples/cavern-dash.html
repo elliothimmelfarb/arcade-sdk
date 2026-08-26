@@ -1,0 +1,113 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cavern Dash — Arcade SDK example</title>
+
+<!--
+  A complete, self-contained example game: one HTML file, no build step.
+
+  It exercises every part of the SDK a real game needs — identity, saves,
+  leaderboard, achievements — and it works in three places without a code
+  change: inside aimade.games, signed out inside aimade.games, and opened
+  straight off your disk (local mode, where saves go to localStorage).
+
+  The achievement slugs it unlocks ("depth-100", "ten-runs") must already be
+  defined by the maker over MCP. See docs/api.md.
+-->
+
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    font: 16px/1.5 system-ui, sans-serif; gap: 1rem; padding: 2rem;
+  }
+  main { width: min(28rem, 100%); display: grid; gap: 1rem; }
+  h1 { margin: 0; font-size: 1.5rem; }
+  button { font: inherit; padding: .6rem 1rem; border-radius: .5rem; cursor: pointer; }
+  ol { margin: 0; padding-left: 1.25rem; }
+  #toast[hidden] { display: none; }
+  #toast { padding: .5rem .75rem; border-radius: .5rem; background: #0002; margin: 0; }
+  .meta { opacity: .7; font-size: .875rem; }
+</style>
+
+<main>
+  <h1>Cavern Dash</h1>
+  <p id="who" class="meta">Connecting…</p>
+  <p id="toast" hidden></p>
+  <button id="dive" type="button">Dive</button>
+  <p id="stats" class="meta"></p>
+  <section>
+    <h2 style="font-size:1rem;margin:0 0 .25rem">Leaderboard</h2>
+    <ol id="board"></ol>
+  </section>
+</main>
+
+<script src="https://aimade.games/arcade.js"></script>
+<script>
+(async function () {
+  const arcade = await Arcade.ready();          // never rejects, never hangs
+
+  // 1 — identity. Display data, never a credential. Guests are normal.
+  const who = arcade.player.isGuest ? 'a guest' : arcade.player.displayName;
+  document.getElementById('who').textContent =
+    'Welcome, ' + who + (arcade.online ? '' : ' — local mode');
+
+  // 2 — load. An empty slot is { ok: true, data: null }, not an error.
+  const loaded = await arcade.saves.get('main');
+  const state = (loaded.ok && loaded.data) || { runs: 0, best: 0 };
+  renderStats();
+
+  // 3 — the leaderboard. Public: it works signed out, with you === null.
+  const board = await arcade.scores.top({ limit: 5, period: 'all' });
+  if (board.ok) {
+    for (const entry of board.entries) {
+      const li = document.createElement('li');
+      li.textContent = entry.rank + '. ' + (entry.player.username || 'anon')
+        + ' — ' + entry.score + ' ' + board.label;
+      document.getElementById('board').append(li);
+    }
+  }
+
+  // 4 — call this when a run ends. Every await below is safe when signed out.
+  async function endRun(depth) {
+    state.runs += 1;
+    state.best = Math.max(state.best, depth);
+    renderStats();
+
+    // Saves: 8 slots, 64 KiB each. Guests get localStorage, silently.
+    await arcade.saves.set('main', state);
+
+    // Scores: signed out this resolves { ok: false, reason: 'SIGNED_OUT' }.
+    const run = await arcade.scores.submit(depth, { runs: state.runs });
+    if (run.ok && run.accepted) toast('New best — rank #' + run.rank);
+
+    // Achievements: the slug must already exist. See the maker call in the docs.
+    if (depth >= 100) {
+      const got = await arcade.achievements.unlock('depth-100');
+      if (got.ok && got.firstTime) toast(got.achievement.emoji + ' ' + got.achievement.name);
+    }
+    if (state.runs >= 10) arcade.achievements.unlock('ten-runs'); // fire and forget
+  }
+
+  function renderStats() {
+    document.getElementById('stats').textContent =
+      state.runs + ' run(s) · best depth ' + state.best;
+  }
+
+  function toast(text) {
+    const el = document.getElementById('toast');
+    el.textContent = text;
+    el.hidden = false;
+    setTimeout(function () { el.hidden = true; }, 2400);
+  }
+
+  // The "game": one button, one random depth. Replace with an actual game.
+  document.getElementById('dive').addEventListener('click', function () {
+    const depth = Math.floor(Math.random() * 140);
+    toast('You reached depth ' + depth);
+    endRun(depth);
+  });
+
+  window.CavernDash = { endRun: endRun, state: state };
+})();
+</script>
