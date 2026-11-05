@@ -124,20 +124,23 @@ The slugs you declare there are exactly the strings your build passes to
 
 ## Matches — async turn-based multiplayer
 
-2–8 seats, seven-day life bumped by every move. The server cannot know whether
-your move is legal and does not try. It enforces, absolutely: participant
-membership, whose seat's turn it is, monotonic and gapless turn numbers, the
-status lifecycle, player-count ceilings and payload size caps.
+2–8 seats, seven-day life bumped by every move. Alternating by default, or
+`'simultaneous'` for one secret move per seat per round, revealed together. The
+server cannot know whether your move is legal and does not try. It enforces,
+absolutely: participant membership, whose seat's turn it is, monotonic and gapless
+turn numbers, round completion, the status lifecycle, player-count ceilings and
+payload size caps.
 
 | Call | Result | Notes |
 | --- | --- | --- |
-| `arcade.matches.create({ maxPlayers: 2, state })` | `{ ok, match }` | You are seat 0. `match.code` is the 8-character join code. |
+| `arcade.matches.create({ maxPlayers: 2, state, mode: 'alternating' })` | `{ ok, match }` | You are seat 0. `match.code` is the 8-character join code. `mode` is optional and fixed at creation: `'alternating'` (default, one seat per turn) or `'simultaneous'` (every seat commits one secret move per round). |
 | `arcade.matches.join('K7Q2M8XR')` | `{ ok, match }` | One account, one seat — rejoining returns the seat you already hold. |
-| `arcade.matches.list({ status: 'active' })` | `{ ok, matches }` | Your matches in this game. Summaries: no `state`, no `result`. |
-| `arcade.matches.get(id, { since: version })` | `{ ok, changed, match, version }` | `changed: false` means nothing moved since that version and `match` is null. |
-| `arcade.matches.move(id, { turn, move, state, status, result, nextSeat })` | `{ ok, match }` | Wrong seat, stale turn or a closed match all resolve `CONFLICT`. `move` caps at 8 KiB. |
+| `arcade.matches.list({ status: 'active' })` | `{ ok, matches }` | Your matches in this game. Summaries: no `state`, no `result`, no `moves`, but `yourMoveNeeded` and `submittedSeats` are there, which is what a lobby list needs. |
+| `arcade.matches.get(id, { since: version })` | `{ ok, changed, match, version }` | `changed: false` means nothing moved since that version and `match` is null. A simultaneous match also carries `mode`, `submittedSeats`, `yourSubmitted`, `yourMoveNeeded` and `moves`: the last 3 revealed rounds, never another seat's move for the round still in play. |
+| `arcade.matches.move(id, { turn, move, state, status, result, nextSeat })` | `{ ok, match }` | Wrong seat, stale turn or a closed match all resolve `CONFLICT`. `move` caps at 8 KiB. Simultaneous: `nextSeat` is `INVALID`, a second move in one round is `CONFLICT`, and `state` and `status: 'finished'` are taken only from the seat that opened the round. |
 | `arcade.matches.leave(id)` | `{ ok, matchId, status }` | An open match loses your seat; an active one becomes `abandoned`. |
-| `arcade.matches.watch(id, onChange)` | `() => void` | Returns an unsubscribe. Polls 3s, backs off to 15s, pauses when the tab is hidden, stops when the match ends. |
+| `arcade.matches.pendingCode` | `string \| null` | Not a call, a value, read after `Arcade.ready()`. Null unless this player arrived through an invite link. Always keep manual code entry. |
+| `arcade.matches.watch(id, onChange)` | `() => void` | Returns an unsubscribe. Polls 3s, backs off to 15s, pauses when the tab is hidden, stops when the match ends. In a simultaneous match it also fires when another seat commits mid-round, before anything is revealed. |
 
 ```js
 // Host: open a table and show the code.
@@ -153,7 +156,7 @@ const matchId = joined.ok ? joined.match.id : null;
 // Both: watch it.
 const stop = arcade.matches.watch(matchId, function (match) {
   draw(match.state);
-  if (match.yourTurn) enableInput(match.turn);
+  if (match.yourMoveNeeded) enableInput(match.turn);   // true in either mode
   if (match.status === 'finished') celebrate(match.result);
 });
 
@@ -174,6 +177,114 @@ if (!played.ok && played.reason === 'CONFLICT') await resync(matchId);
 stop();                             // and arcade.matches.leave(matchId) to quit
 ```
 
+`version` only ever goes up. Pass the last one you saw as `since` and an unchanged
+match answers `{ changed: false }` instead of a payload. It moves on anything a
+seat could see, so treat it as an opaque number to compare, never as the turn
+count.
+
+### Simultaneous rounds
+
+Pass `mode: 'simultaneous'` to `create()` and every seat submits exactly one move
+against the same turn number. The round completes when the last of them lands.
+The mode is fixed at creation.
+
+While a round is in play, another seat's move for it is absent from what you
+read, not blanked. Your own submission does come back, which is how a client that
+reloaded knows it has already played. Earlier rounds are public to everyone, and
+so is everything once the match is over.
+
+```js
+// Rock-paper-scissors: both seats commit blind, the arcade reveals together.
+const made = await arcade.matches.create({
+  maxPlayers: 2,
+  mode: 'simultaneous',              // fixed here and nowhere else
+  state: { round: 0, scores: [0, 0] },
+});
+
+// Watch fires twice a round: once when a seat commits (submittedSeats grows,
+// version moves) and once when the round reveals and the turn moves on.
+const stop = arcade.matches.watch(matchId, function (match) {
+  // 1. Fold the revealed rounds into your checkpoint. match.moves carries the
+  //    last 3 rounds, every seat, oldest first. Anything older is already
+  //    inside match.state, which is why that window is enough.
+  let view = match.state;
+  for (const round of groupByTurn(match.moves)) {
+    if (round.turn < view.round) continue;             // already folded in
+    if (round.moves.length < match.players.length) continue;  // still secret
+    view = resolve(view, round.moves);   // pure: same inputs, same answer,
+  }                                      // on every client, no negotiation
+  draw(view);
+
+  // 2. One flag, both modes: does this match want a move out of you?
+  if (match.yourMoveNeeded) enableThrows(match.turn, view);
+  else showWaiting(match.submittedSeats);  // who has played is public,
+                                           // what they played is not
+  if (match.status === 'finished') celebrate(match.result);
+});
+
+// 3. Play the round. No nextSeat: nobody hands the turn to anybody, and
+//    sending one is INVALID rather than quietly ignored.
+const played = await arcade.matches.move(matchId, {
+  turn: match.turn,
+  move: { throw: 'rock' },     // secret until every seat has played
+  state: view,                 // resolved rounds ONLY, never this throw
+  status: view.scores.some((s) => s >= 3) ? 'finished' : 'active',
+});
+
+if (!played.ok && played.reason === 'CONFLICT') await resync(matchId);
+                                   // stale turn, or you already played it
+```
+
+- **`yourMoveNeeded` is the flag to branch on.** It means "this match is waiting
+  on you" in both modes. `yourTurn` still means the seat pointer, so it is always
+  `false` in a simultaneous match.
+- **`submittedSeats` is public, the payloads are not.** It is in every read,
+  including list summaries. `yourSubmitted` is your own row of it.
+- **`match.moves` is a window, not a history.** It carries the last 3 rounds you
+  are allowed to see, oldest first. Fold anything older into `state` as you go.
+  Alternating matches carry none.
+- **Only the seat that opens a round writes `state` or declares
+  `status: 'finished'`.** Send both anyway; the server decides. Your state must
+  describe rounds already revealed, never the move you are making now. The
+  opener's state was computed before its author could know what anybody else
+  would play, so it cannot leak the round. A later submitter's is dropped, because
+  theirs was computed knowing their own move.
+- **Resolution is yours and must be deterministic.** The server never judges a
+  round. Every client derives the identical next state from the checkpoint, the
+  revealed moves and any seed you put in that state. Do not call `Math.random()`
+  during resolution.
+
+### Invite links
+
+Any match code can be sent as a URL:
+
+```
+https://aimade.games/g/{slug}/play?code=K7Q2M8XR
+```
+
+The play page checks the code's shape and hands it to your game in the handshake,
+so by the time `Arcade.ready()` resolves it is in `arcade.matches.pendingCode`. A
+code that is malformed is ignored by the page, and one that is expired or spent is
+refused by `join()`.
+
+```js
+const invite = arcade.matches.pendingCode;   // "K7Q2M8XR", or null
+
+if (invite) {
+  showJoinButton('Join the match', async function () {
+    const res = await arcade.matches.join(invite);
+    if (res.ok) startMatch(res.match);
+    else showCodeEntry(res.message);         // expired, full, or already yours
+  });
+} else {
+  showCodeEntry();                           // the eight-character input
+}
+```
+
+`pendingCode` is null for everybody who opened your game the ordinary way, so
+keep the manual path. A join code is a bearer capability, not an identity: the
+seat is still bound to the account that claims it, one per account.
+
 ## Failure reasons
 
 | `reason` | What it means |
@@ -183,7 +294,7 @@ stop();                             // and arcade.matches.leave(matchId) to quit
 | `NOT_FOUND` | The game, save, match or achievement slug is not there. An undefined slug lands here. |
 | `INVALID` | The payload failed validation — or you passed a bad argument, which resolves without leaving the frame. |
 | `TOO_LARGE` | A size cap, counted in bytes after `JSON.stringify`. A four-byte emoji costs four bytes. |
-| `CONFLICT` | Not your turn, a stale turn number, a full match, or the ninth save slot. |
+| `CONFLICT` | Not your turn, a stale turn number, a second move in one simultaneous round, a full match, or the ninth save slot. |
 | `RATE_LIMITED` | Slow down. Carries `retryAfterMs`. |
 | `UNSUPPORTED_METHOD` | This host does not know that method — you are newer than it is. Degrade, do not crash. |
 | `UNAVAILABLE` | Local mode, the arcade kill switch, or an upstream failure. |
@@ -207,5 +318,6 @@ stop();                             // and arcade.matches.leave(matchId) to quit
 ## Compatibility
 
 The SDK is strictly backwards compatible for the life of protocol 1: fields may
-be added, never removed or repurposed. If a host answers `UNSUPPORTED_METHOD`,
+be added, never removed or repurposed. `mode` and `pendingCode` arrived that way,
+so a game written before them sees exactly what it saw before. If a host answers `UNSUPPORTED_METHOD`,
 your build is newer than that host — degrade, do not crash.

@@ -24,6 +24,13 @@
  *  3. **It works signed out.** `player.isGuest` is true, saves are local, and
  *     every server write resolves `{ ok: false, reason: 'SIGNED_OUT' }`.
  *
+ * Multiplayer comes in two shapes, chosen once at `matches.create`. The default,
+ * `mode: 'alternating'`, is one seat per turn. `mode: 'simultaneous'` is every
+ * seat committing one move per round without seeing the others: the server
+ * withholds them until the round is complete, then reveals them together in
+ * `match.moves`. Secrecy is the server's, not this file's: there is no rules
+ * logic down here to get around.
+ *
  * One thing it deliberately does NOT do: trust the parent. The host page hands
  * this SDK display data, never credentials, and a hostile third-party embedder
  * could frame your game and lie about who is playing. Nothing here depends on
@@ -268,6 +275,8 @@
   var online = false;
   var player = GUEST;
   var capabilities = LOCAL_CAPABILITIES;
+  /** A join code the player arrived holding, from an invite link. Usually null. */
+  var pendingCode = null;
 
   function onMessage(event) {
     var data = event && event.data;
@@ -389,6 +398,12 @@
           var init = response.result;
           if (isObject(init.player)) player = init.player;
           if (isObject(init.capabilities)) capabilities = init.capabilities;
+          // Additive to protocol 1: an older host simply never sends it, and
+          // `matches.pendingCode` stays null exactly as it does for a player
+          // who opened the game the ordinary way.
+          if (typeof init.pendingJoinCode === 'string' && init.pendingJoinCode) {
+            pendingCode = init.pendingJoinCode;
+          }
         }
         finish();
       };
@@ -530,15 +545,40 @@
   }
 
   var matches = {
+    /**
+     * The join code this player arrived holding, or null.
+     *
+     * Someone followed `/g/<slug>/play?code=XXXXXXXX`, the site checked the
+     * shape and handed it over at boot, so a lobby can offer one tap instead
+     * of asking for eight characters. Null for everybody else, which is most
+     * people, so keep the manual entry path: this is a shortcut, not a route.
+     */
+    pendingCode: null,
+
+    /**
+     * Open a match and take the first seat.
+     *
+     *   `maxPlayers`: required, 2 to 8.
+     *   `state`:      the opening position. Optional, defaults to `{}`.
+     *   `mode`:       `'alternating'` (default) hands the turn round the table
+     *                  one seat at a time. `'simultaneous'` gives every seat one
+     *                  secret move per round, revealed together once the last
+     *                  seat has played. Fixed at creation; the server decides
+     *                  which words it accepts, this only forwards yours.
+     */
     create: function (options) {
       var o = isObject(options) ? options : {};
       if (typeof o.maxPlayers !== 'number') {
         return badArg('maxPlayers is required and must be a number.');
       }
-      return call('matches.create', {
+      var payload = {
         maxPlayers: o.maxPlayers,
         state: o.state === undefined ? {} : o.state,
-      }).then(matchResult);
+      };
+      // Omitted rather than defaulted: a match created without a mode is
+      // alternating, which is what every match was before modes existed.
+      if (typeof o.mode === 'string') payload.mode = o.mode;
+      return call('matches.create', payload).then(matchResult);
     },
 
     join: function (code) {
@@ -786,6 +826,7 @@
       api.online = online;
       api.player = player;
       api.capabilities = capabilities;
+      matches.pendingCode = pendingCode;
       return api;
     });
     return readyPromise;

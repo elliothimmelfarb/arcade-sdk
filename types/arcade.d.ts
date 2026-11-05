@@ -46,7 +46,7 @@ export type ArcadeFailureReason =
   | 'INVALID'
   /** A size cap, counted in bytes after `JSON.stringify`. */
   | 'TOO_LARGE'
-  /** Not your turn, a stale turn number, a full match, or the ninth save slot. */
+  /** Not your turn, a stale turn, a repeat move in a round, a full match, or the ninth save slot. */
   | 'CONFLICT'
   /** Slow down. Carries `retryAfterMs`. */
   | 'RATE_LIMITED'
@@ -276,10 +276,27 @@ export interface ArcadeAchievements {
 
 export type ArcadeMatchStatus = 'open' | 'active' | 'finished' | 'abandoned';
 
+/**
+ * How a round is played, fixed at creation. `alternating` is one seat per turn.
+ * `simultaneous` is every seat committing one secret move per round, revealed
+ * together once the last seat has played.
+ */
+export type ArcadeMatchMode = 'alternating' | 'simultaneous';
+
 export interface ArcadeMatchPlayer {
   seat: number;
   player: ArcadePlayer;
   isYou: boolean;
+  joinedAt: string;
+}
+
+/** One revealed move of a simultaneous match. */
+export interface ArcadeRevealedMove {
+  turn: number;
+  seat: number;
+  move: unknown;
+  isYou: boolean;
+  createdAt: string;
 }
 
 export interface ArcadeMatch<TState = unknown, TResult = unknown> {
@@ -287,41 +304,71 @@ export interface ArcadeMatch<TState = unknown, TResult = unknown> {
   /** The 8-character Crockford base32 join code. Goes `null` once spent. */
   code: string | null;
   status: ArcadeMatchStatus;
+  /** `alternating` unless the game asked otherwise at creation. */
+  mode: ArcadeMatchMode;
   maxPlayers: number;
-  seatCount: number;
   currentSeat: number;
   turn: number;
+  /**
+   * The number a watcher compares against. It moves on anything a seat could
+   * see, including another seat committing mid-round, so treat it as opaque.
+   * It only ever goes up. It is not the turn count.
+   */
   version: number;
-  yourSeat: number | null;
+  yourSeat: number;
+  /** Alternating only: the seat pointer is on you. Always false otherwise. */
   yourTurn: boolean;
+  /** The match is waiting on you, in either mode. Branch on this one. */
+  yourMoveNeeded: boolean;
+  /** Seats that have played the round in hand. Who played is public, what is not. */
+  submittedSeats: number[];
+  yourSubmitted: boolean;
   players: ArcadeMatchPlayer[];
+  /**
+   * Revealed moves, oldest first: the last 3 rounds of a simultaneous match plus
+   * your own submission for the round in play. Empty for an alternating match.
+   */
+  moves: ArcadeRevealedMove[];
   state: TState | null;
   result: TResult | null;
-  createdAt: string;
+  updatedAt: string;
   expiresAt: string;
-  finishedAt: string | null;
 }
 
-/** A list entry: no `state`, no `result`. */
-export type ArcadeMatchSummary = Omit<ArcadeMatch, 'state' | 'result'>;
+/** A list entry: no `state`, no `result`, no `moves`. */
+export type ArcadeMatchSummary = Omit<ArcadeMatch, 'state' | 'result' | 'moves'>;
 
 export interface ArcadeMatchMove<TState = unknown, TResult = unknown> {
   /** The turn you believe you are playing. This plus your seat is the whole CC. */
   turn: number;
   move: unknown;
-  /** The whole state, not a patch. 32 KiB cap. */
+  /**
+   * The whole state, not a patch. 32 KiB cap. In a simultaneous match it must
+   * describe resolved rounds only, never the move you are making now.
+   */
   state: TState;
-  status?: ArcadeMatchStatus;
+  /** Defaults to `active`. */
+  status?: 'active' | 'finished';
   result?: TResult | null;
-  /** Optional; the default is round-robin over the occupied seats. */
+  /**
+   * Optional; the default is round-robin over the occupied seats. Sending one
+   * in a simultaneous match resolves `INVALID`.
+   */
   nextSeat?: number;
 }
 
 export interface ArcadeMatches {
+  /**
+   * The join code this player arrived holding, from an invite link, or null.
+   * Null for nearly everybody, so always keep the manual entry path.
+   */
+  readonly pendingCode: string | null;
   /** You are seat 0. `match.code` is the join code to show. */
   create<TState = unknown>(options?: {
     maxPlayers?: number;
     state?: TState;
+    /** Fixed here and nowhere else. Omit it for `alternating`. */
+    mode?: ArcadeMatchMode;
   }): Promise<ArcadeResult<{ match: ArcadeMatch<TState> }>>;
   /** One account, one seat — rejoining returns the seat you already hold. */
   join<TState = unknown>(code: string): Promise<ArcadeResult<{ match: ArcadeMatch<TState> }>>;
@@ -334,7 +381,10 @@ export interface ArcadeMatches {
     matchId: string,
     options?: { since?: number },
   ): Promise<ArcadeResult<{ changed: boolean; match: ArcadeMatch<TState> | null; version: number }>>;
-  /** Wrong seat, stale turn or a closed match all resolve `CONFLICT`. */
+  /**
+   * Wrong seat, stale turn or a closed match all resolve `CONFLICT`, and so does
+   * a second move from one seat in one simultaneous round.
+   */
   move<TState = unknown>(
     matchId: string,
     move: ArcadeMatchMove<TState>,
@@ -346,6 +396,7 @@ export interface ArcadeMatches {
   /**
    * Polls every 3s, backs off to 15s once nothing has happened for ten polls,
    * pauses while the tab is hidden, and stops for good when the match ends.
+   * In a simultaneous match it also fires when another seat commits mid-round.
    * Returns an unsubscribe function.
    */
   watch<TState = unknown>(
